@@ -1,0 +1,164 @@
+#!/usr/bin/python3
+
+import serial
+import time
+import argparse
+import sys
+import re
+from textwrap import wrap
+
+class ModemSMS:
+    def __init__(self, port='/dev/modemAT', baudrate=115200, timeout=1):
+        self.ser = serial.Serial(port, baudrate, timeout=timeout)
+        
+    def send_command(self, command, expected_response='OK', timeout=5):
+        self.ser.write(f'{command}\r\n'.encode())
+        start_time = time.time()
+        response = ''
+        while time.time() - start_time < timeout:
+            if self.ser.in_waiting:
+                response += self.ser.read(self.ser.in_waiting).decode()
+                if expected_response in response:
+                    return response.strip()
+            time.sleep(0.1)
+        raise TimeoutError(f"Command '{command}' timed out")
+
+    def send_sms(self, number, message):
+        try:
+            self.send_command('AT+CMGF=1')  # Set SMS mode to text
+            self.send_command(f'AT+CMGS="{number}"', '>')
+            response = self.send_command(f'{message}\x1A', '+CMGS', timeout=30)
+            return True  # If we get here, the message was likely sent successfully
+        except TimeoutError:
+            return False
+
+    def check_received_sms(self):
+        self.send_command('AT+CMGF=1')  # Set SMS mode to text
+        response = self.send_command('AT+CMGL="ALL"')
+        return self.parse_received_messages(response)
+
+    def parse_received_messages(self, response):
+        pattern = r'\+CMGL: (\d+),"([^"]+)","([^"]+)",?,"([^"]+)"\r?\n(.+?)(?=\r?\n\+CMGL|\r?\nOK|\Z)'
+        matches = re.findall(pattern, response, re.DOTALL)
+        return matches
+
+    def format_received_messages(self, matches, quiet=False):
+        if not matches:
+            return "No messages found."
+
+        if quiet:
+            formatted_messages = []
+            for i, (index, status, sender, timestamp, content) in enumerate(matches):
+                content = re.sub(r'\s*OK\s*$', '', content.strip())
+                content = content.replace('"', '\\"')  # Escape double quotes
+                sender = sender.replace('"', '\\"')  # Escape double quotes in sender
+                formatted_messages.extend([
+                    f'MESSAGE[{i}]="{content}"',
+                    f'TIME[{i}]="{timestamp}"',
+                    f'SENDER[{i}]="{sender}"',
+                    f'STATUS[{i}]="{status}"',
+                    f'INDEX[{i}]="{index}"'
+                ])
+            return '\n'.join(formatted_messages)
+        else:
+            formatted_messages = []
+            for match in matches:
+                index, status, sender, timestamp, content = match
+                content = re.sub(r'\s*OK\s*$', '', content.strip())
+                wrapped_content = '\n'.join(wrap(content, width=70))
+                formatted_message = (
+                    f"{'=' * 70}\n"
+                    f"Message ID: {index}\n"
+                    f"Status: {status}\n"
+                    f"From: {sender}\n"
+                    f"Timestamp: {timestamp}\n"
+                    f"Content:\n{wrapped_content}\n"
+                )
+                formatted_messages.append(formatted_message)
+            return '\n'.join(formatted_messages)
+
+    def delete_sms(self, index):
+        response = self.send_command(f'AT+CMGD={index}')
+        return 'OK' in response
+
+    def delete_all_sms(self):
+        response = self.send_command('AT+CMGD=1,4')  # 1,4 deletes all messages
+        return 'OK' in response
+
+    def close(self):
+        self.ser.close()
+
+def main():
+    script_name = sys.argv[0]
+    parser = argparse.ArgumentParser(
+        description='Modem SMS Operations - Interface with a modem for sending, checking, and deleting SMS messages.',
+        epilog=f'Example usage:\n'
+               f'  {script_name} send "+1234567890" "Hello, world!"\n'
+               f'  {script_name} check\n'
+               f'  {script_name} check -q\n'
+               f'  {script_name} delete 1\n'
+               f'  {script_name} delete all\n'
+               f'  {script_name} --port /dev/ttyUSB0 --baudrate 9600 send "+1234567890" "Custom port and baudrate"',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        add_help=False
+    )
+    parser.add_argument('-h', '--help', '-?', action='help', help='Show this help message and exit')
+    parser.add_argument('-q', '--quiet', action='store_true', help='Output in quiet mode (for use with other programs)')
+    parser.add_argument('--port', default='/dev/modemAT', help='Modem port (default: %(default)s)')
+    parser.add_argument('--baudrate', type=int, default=115200, help='Baud rate (default: %(default)s)')
+    
+    subparsers = parser.add_subparsers(dest='command', help='SMS operations')
+    
+    # Send SMS
+    send_parser = subparsers.add_parser('send', help='Send an SMS message')
+    send_parser.add_argument('number', help='Recipient phone number (include country code, e.g., "+1234567890")')
+    send_parser.add_argument('message', help='Message content to send')
+    
+    # Check received SMS
+    subparsers.add_parser('check', help='Check and display all received SMS messages')
+    
+    # Delete SMS
+    delete_parser = subparsers.add_parser('delete', help='Delete a specific SMS message or all messages')
+    delete_parser.add_argument('index', help='Index of the message to delete or "all" to delete all messages')
+    
+    # Help command
+    subparsers.add_parser('help', help='Show this help message and exit')
+    
+    args = parser.parse_args()
+    
+    if args.command == 'help' or not args.command:
+        parser.print_help()
+        return
+
+    modem = ModemSMS(port=args.port, baudrate=args.baudrate)
+    
+    try:
+        if args.command == 'send':
+            if modem.send_sms(args.number, args.message):
+                print(f"SMS sent successfully to {args.number}")
+            else:
+                print(f"Failed to send SMS to {args.number}")
+        elif args.command == 'check':
+            received = modem.check_received_sms()
+            formatted = modem.format_received_messages(received, quiet=args.quiet)
+            print(formatted)
+        elif args.command == 'delete':
+            if args.index.lower() == 'all':
+                if modem.delete_all_sms():
+                    print("All messages deleted successfully")
+                else:
+                    print("Failed to delete all messages")
+            else:
+                try:
+                    index = int(args.index)
+                    if modem.delete_sms(index):
+                        print(f"Message at index {index} deleted successfully")
+                    else:
+                        print(f"Failed to delete message at index {index}")
+                except ValueError:
+                    print("Invalid index. Please use a number or 'all'.")
+    finally:
+        modem.close()
+
+if __name__ == '__main__':
+    main()
